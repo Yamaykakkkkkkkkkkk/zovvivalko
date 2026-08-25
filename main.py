@@ -18,7 +18,7 @@ import threading
 
 from flask import Flask
 
-from telegram import Update
+from telegram import Update, User
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
@@ -42,7 +42,7 @@ log = logging.getLogger("group-call")
 
 CHUNK_SIZE = 5        # упоминаний в одном сообщении
 SEND_DELAY = 1.5      # пауза между сообщениями одного цикла, сек
-MIN_INTERVAL = 10     # минимальный интервал цикла, сек
+MIN_INTERVAL = 1      # минимальный интервал цикла, сек (rate limits учитывает SEND_DELAY)
 MAX_INTERVAL = 24 * 60 * 60
 
 INTERVAL_RE = re.compile(r"(\d+)([smh])")
@@ -50,7 +50,7 @@ INTERVAL_RE = re.compile(r"(\d+)([smh])")
 USAGE_TEXT = (
     "Использование: /startcall <число><s|m|h>\n"
     "Примеры: /startcall 30s, /startcall 5m, /startcall 2h\n"
-    "Интервал от 10 секунд до 24 часов."
+    "Интервал от 1 секунды до 24 часов."
 )
 
 START_TEXT = (
@@ -58,7 +58,10 @@ START_TEXT = (
     "/startcall <интервал> — запустить цикл, например /startcall 10m\n"
     "/stopcall — остановить цикл в этой группе\n"
     "/call — один цикл прямо сейчас\n\n"
-    "Интервал задаётся как число + s/m/h (30s, 5m, 2h).\n"
+    "Интервал задаётся как число + s/m/h (30s, 5m, 2h).\n\n"
+    "Важно: Telegram Bot API не позволяет получить полный список "
+    "участников группы, поэтому я упоминаю тех, кого реально видел "
+    "в чате (сообщения, вход/выход и т.п.).\n"
     "Управление доступно только администраторам группы."
 )
 
@@ -70,8 +73,9 @@ NO_MEMBERS_TEXT = (
 
 # chat_id -> {"interval": секунды, "task": asyncio.Task | None}
 timers: dict[int, dict] = {}
-# chat_id -> {user_id: (имя, username или None)}
-known_members: dict[int, dict[int, tuple[str, str | None]]] = {}
+# ИЗВЕСТНЫЕ пользователи, а не полный состав группы: known_members[chat_id][user_id] = User
+# (у User есть id, username, first_name). Bot API полный roster не отдаёт.
+known_members: dict[int, dict[int, User]] = {}
 
 flask_app = Flask(__name__)
 
@@ -109,11 +113,11 @@ async def cancel_task(task: asyncio.Task | None) -> None:
             await task
 
 
-def remember_user(chat_id: int, user) -> None:
+def remember_user(chat_id: int, user: User | None) -> None:
+    """Обновляем сведения о пользователе при каждом событии; не ботов не удаляем по таймауту."""
     if user is None or user.is_bot:
         return
-    name = user.full_name or str(user.id)
-    known_members.setdefault(chat_id, {})[user.id] = (name, user.username)
+    known_members.setdefault(chat_id, {})[user.id] = user
 
 
 async def ensure_group_admin(update: Update) -> bool:
@@ -147,11 +151,11 @@ async def ensure_group_admin(update: Update) -> bool:
     return True
 
 
-def format_mention(user_id: int, info: tuple[str, str | None]) -> str:
-    name, username = info
-    if username:
-        return f"@{username}"
-    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+def format_mention(user: User) -> str:
+    if user.username:
+        return f"@{user.username}"
+    name = user.full_name or str(user.id)
+    return f'<a href="tg://user?id={user.id}">{html.escape(name)}</a>'
 
 
 async def send_chunks(bot: ExtBot, chat_id: int, chunks: list, total: int) -> None:
@@ -159,11 +163,11 @@ async def send_chunks(bot: ExtBot, chat_id: int, chunks: list, total: int) -> No
         start = index * CHUNK_SIZE + 1
         end = start + len(chunk) - 1
         header = (
-            f"📣 Зову {start}–{end} из {total}:"
+            f"📣 Зову известных участников {start}–{end} из {total}:"
             if len(chunks) > 1
-            else f"📣 Зову ({total}):"
+            else f"📣 Зову известных участников ({total}):"
         )
-        text = f"{header}\n" + ", ".join(format_mention(*item) for item in chunk)
+        text = f"{header}\n" + ", ".join(format_mention(user) for user in chunk)
 
         try:
             await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
@@ -185,14 +189,15 @@ async def send_chunks(bot: ExtBot, chat_id: int, chunks: list, total: int) -> No
 
 
 async def run_cycle(bot: ExtBot, chat_id: int) -> None:
-    chat_members = known_members.get(chat_id) or {}
-    if not chat_members:
+    # Берём только известных боту пользователей этого chat_id.
+    users = list(known_members.get(chat_id, {}).values())
+    if not users:
         await bot.send_message(chat_id, NO_MEMBERS_TEXT)
         return
 
-    items = sorted(chat_members.items(), key=lambda item: item[1][0].lower())
-    chunks = [items[i : i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
-    await send_chunks(bot, chat_id, chunks, total=len(items))
+    users.sort(key=lambda user: (user.full_name or "").lower())
+    chunks = [users[i : i + CHUNK_SIZE] for i in range(0, len(users), CHUNK_SIZE)]
+    await send_chunks(bot, chat_id, chunks, total=len(users))
 
 
 def report_task_error(task: asyncio.Task) -> None:
@@ -237,11 +242,18 @@ async def cmd_startcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await cancel_task(old_task)
     state["task"] = asyncio.create_task(timer_loop(context.bot, chat.id))
 
-    count = len(known_members.get(chat.id, {}))
-    suffix = "" if count else "\nСписок пока пуст — напишите что-нибудь в чат, чтобы бот вас запомнил."
+    known_count = len(known_members.get(chat.id, {}))
+    try:
+        # Официальный метод Bot API: только ЧИСЛО участников, не их список.
+        total_count = await context.bot.get_chat_member_count(chat.id)
+        total_note = f" Всего в группе по данным Telegram: {total_count}."
+    except TelegramError:
+        total_note = ""
+
+    suffix = "" if known_count else "\nИзвестных пока нет — напишите что-нибудь в чат, чтобы бот вас запомнил."
     await message.reply_text(
         f"Цикл запущен: упоминания каждые {humanize_interval(interval)}. "
-        f"Известных участников: {count}.{suffix}"
+        f"Известных участников: {known_count}.{total_note}{suffix}"
     )
 
 
@@ -267,14 +279,47 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task.add_done_callback(report_task_error)
 
 
+async def migrate_chat_state(context: ContextTypes.DEFAULT_TYPE, old_id: int, new_id: int) -> None:
+    """При превращении группы в супергруппу Telegram меняет chat_id — переносим состояние."""
+    if old_id == new_id:
+        return
+    log.info("Чат %s мигрировал в %s, переношу состояние", old_id, new_id)
+
+    if old_id in known_members:
+        known_members[new_id] = known_members.pop(old_id)
+
+    state = timers.pop(old_id, None)
+    if state is None:
+        return
+
+    was_running = bool(state["task"] and not state["task"].done())
+    await cancel_task(state["task"])
+    timers[new_id] = state
+    if was_running:
+        state["task"] = asyncio.create_task(timer_loop(context.bot, new_id))
+
+
 async def track_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bot API не умеет перечислять участников — запоминаем тех, кто виден в апдейтах."""
+    """Bot API не умеет перечислять участников — собираем всех, кто виден в апдейтах.
+
+    Пополняем реестр при каждом событии (from_user, new_chat_members, pinned,
+    forward), удаляем только реально покинувших чат. По таймауту никого не вычищаем.
+    """
     chat = update.effective_chat
     message = update.effective_message
 
-    remember_user(chat.id, update.effective_user)
+    # Группа стала супергруппой: у чата новый id, состояние нужно перенести.
+    if message.migrate_to_chat_id:
+        await migrate_chat_state(context, chat.id, message.migrate_to_chat_id)
+        return
+
+    remember_user(chat.id, message.from_user)
     for user in message.new_chat_members or []:
         remember_user(chat.id, user)
+    if message.pinned_message is not None:
+        remember_user(chat.id, message.pinned_message.from_user)
+    remember_user(chat.id, getattr(message.forward_origin, "sender_user", None))
+
     left = message.left_chat_member
     if left and not left.is_bot:
         known_members.get(chat.id, {}).pop(left.id, None)
