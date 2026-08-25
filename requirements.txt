@@ -1,0 +1,2 @@
+python-telegram-bot~=21.11
+flask~=3.1
