@@ -85,3 +85,10 @@ python main.py
 * таймеры и известные участники живут в RAM и сбрасываются после перезапуска —
   это ожидаемое поведение;
 * бот не пишет пользователям в личку, только в тот чат, где вызвана команда.
+
+## License
+
+Copyright (C) 2026 Linuin
+
+This project is licensed under the GNU General Public License v3.0.
+See the [LICENSE](LICENSE) file for details.
